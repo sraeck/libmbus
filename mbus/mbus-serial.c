@@ -27,6 +27,9 @@
 
 #define PACKET_BUFF_SIZE 2048
 
+#define WAKEUP_LEN  210
+#define WAKEUP_BYTE 0x00
+
 //------------------------------------------------------------------------------
 /// Set up a serial connection handle.
 //------------------------------------------------------------------------------
@@ -242,11 +245,13 @@ mbus_serial_send_frame(mbus_handle *handle, mbus_frame *frame)
         return -1;
     }
 
-    if ((len = mbus_frame_pack(frame, buff, sizeof(buff))) == -1)
+    memset(buff, WAKEUP_BYTE, WAKEUP_LEN);
+    if ((len = mbus_frame_pack(frame, buff+WAKEUP_LEN, sizeof(buff)-WAKEUP_LEN)) == -1)
     {
         fprintf(stderr, "%s: mbus_frame_pack failed\n", __PRETTY_FUNCTION__);
         return -1;
     }
+    len += WAKEUP_LEN;
 
 #ifdef MBUS_SERIAL_DEBUG
     // if debug, dump in HEX form to stdout what we write to the serial port

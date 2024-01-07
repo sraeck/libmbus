@@ -1892,7 +1892,7 @@ mbus_send_application_reset_frame(mbus_handle * handle, int address, int subcode
 // send a request packet to from master to slave
 //------------------------------------------------------------------------------
 int
-mbus_send_request_frame(mbus_handle * handle, int address)
+mbus_send_request_frame_extended(mbus_handle * handle, int address, int control)
 {
     int retval = 0;
     mbus_frame *frame;
@@ -1911,7 +1911,7 @@ mbus_send_request_frame(mbus_handle * handle, int address)
         return -1;
     }
 
-    frame->control = MBUS_CONTROL_MASK_REQ_UD2 | MBUS_CONTROL_MASK_DIR_M2S;
+    frame->control = control | MBUS_CONTROL_MASK_DIR_M2S;
     frame->address = address;
 
     if (mbus_send_frame(handle, frame) == -1)

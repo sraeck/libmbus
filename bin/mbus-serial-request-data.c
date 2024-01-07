@@ -50,13 +50,16 @@ init_slaves(mbus_handle *handle)
 int
 main(int argc, char **argv)
 {
+    int result = 1;
+
     mbus_frame reply;
     mbus_frame_data reply_data;
     mbus_handle *handle = NULL;
 
     char *device, *addr_str, *xml_result;
     int address;
-    long baudrate = 9600;
+    long baudrate = 2400;
+    int i;
 
     memset((void *)&reply, 0, sizeof(mbus_frame));
     memset((void *)&reply_data, 0, sizeof(mbus_frame_data));
@@ -108,76 +111,69 @@ main(int argc, char **argv)
     if (mbus_connect(handle) == -1)
     {
         fprintf(stderr,"Failed to setup connection to M-bus gateway\n");
-        mbus_context_free(handle);
-        return 1;
+        goto FAILC;
     }
 
     if (mbus_serial_set_baudrate(handle, baudrate) == -1)
     {
-        fprintf(stderr,"Failed to set baud rate.\n");
-        mbus_disconnect(handle);
-        mbus_context_free(handle);
-        return 1;
+        fprintf(stderr,"Failed to set baud rate to %ld.\n", baudrate);
+        goto FAIL;
     }
 
+#if 0
     if (init_slaves(handle) == 0)
     {
-        mbus_disconnect(handle);
-        mbus_context_free(handle);
-        return 1;
+        goto FAIL;
     }
+#endif
 
-    if (mbus_is_secondary_address(addr_str))
+    // primary addressing
+    address = atoi(addr_str);
+
+#if 0
+    // Application reset without subcode
+    if (mbus_send_application_reset_frame(handle, address, -1) == -1)
     {
-        // secondary addressing
-
-        int ret;
-
-        ret = mbus_select_secondary_address(handle, addr_str);
-
-        if (ret == MBUS_PROBE_COLLISION)
-        {
-            fprintf(stderr, "%s: Error: The address mask [%s] matches more than one device.\n", __PRETTY_FUNCTION__, addr_str);
-            mbus_disconnect(handle);
-            mbus_context_free(handle);
-            return 1;
-        }
-        else if (ret == MBUS_PROBE_NOTHING)
-        {
-            fprintf(stderr, "%s: Error: The selected secondary address does not match any device [%s].\n", __PRETTY_FUNCTION__, addr_str);
-            mbus_disconnect(handle);
-            mbus_context_free(handle);
-            return 1;
-        }
-        else if (ret == MBUS_PROBE_ERROR)
-        {
-            fprintf(stderr, "%s: Error: Failed to select secondary address [%s].\n", __PRETTY_FUNCTION__, addr_str);
-            mbus_disconnect(handle);
-            mbus_context_free(handle);
-            return 1;
-        }
-        // else MBUS_PROBE_SINGLE
-        
-        address = MBUS_ADDRESS_NETWORK_LAYER;
+        fprintf(stderr, "Failed to send M-Bus app reset frame.\n");
+        goto FAIL;
     }
-    else
+
+    // Get answer to app reset
+    if (mbus_purge_frames(handle) != 1)
     {
-        // primary addressing
-        address = atoi(addr_str);
+        fprintf(stderr, "Failed to receive M-Bus response to app reset.\n");
     }
+#endif
 
-    if (mbus_send_request_frame(handle, address) == -1)
+    // Send Landis+Gyr REQ_UD2 special variant to get answer with 9600 baud 
+    if (mbus_send_request_frame_9600(handle, address) == -1)
     {
         fprintf(stderr, "Failed to send M-Bus request frame.\n");
-        mbus_disconnect(handle);
-        mbus_context_free(handle);
-        return 1;
+        goto FAIL;
     }
 
-    if (mbus_recv_frame(handle, &reply) != MBUS_RECV_RESULT_OK)
+    // Switch to 9600 baud
+    mbus_disconnect(handle);
+    mbus_connect(handle);
+    baudrate = 9600;
+    if (mbus_serial_set_baudrate(handle, baudrate) == -1)
+    {
+        fprintf(stderr,"Failed to set baud rate to %ld.\n", baudrate);
+        goto FAIL;
+    }
+
+    // Wait long for answer by retrying 10 times, answer is delayed by ~600ms
+    for (i=0; i<10; i++)
+    {
+        if (mbus_recv_frame(handle, &reply) == MBUS_RECV_RESULT_OK)
+        {
+            break;
+        }
+    }
+    if (i>=10)
     {
         fprintf(stderr, "Failed to receive M-Bus response frame.\n");
-        return 1;
+        goto FAIL;
     }
 
     //
@@ -194,9 +190,7 @@ main(int argc, char **argv)
     if (mbus_frame_data_parse(&reply, &reply_data) == -1)
     {
         fprintf(stderr, "M-bus data parse error: %s\n", mbus_error_str());
-        mbus_disconnect(handle);
-        mbus_context_free(handle);
-        return 1;
+        goto FAIL;
     }
 
     //
@@ -205,9 +199,7 @@ main(int argc, char **argv)
     if ((xml_result = mbus_frame_data_xml(&reply_data)) == NULL)
     {
         fprintf(stderr, "Failed to generate XML representation of MBUS frame: %s\n", mbus_error_str());
-        mbus_disconnect(handle);
-        mbus_context_free(handle);
-        return 1;
+        goto FAIL;
     }
 
     printf("%s", xml_result);
@@ -219,10 +211,11 @@ main(int argc, char **argv)
         mbus_data_record_free(reply_data.data_var.record); // free's up the whole list
     }
 
+    result = 0;
+FAIL:
     mbus_disconnect(handle);
+FAILC:
     mbus_context_free(handle);
-    return 0;
+    return result;
 }
-
-
 

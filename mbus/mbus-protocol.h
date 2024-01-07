@@ -347,6 +347,7 @@ typedef struct _mbus_data_secondary_address {
 
 #define MBUS_CONTROL_MASK_SND_NKE       0x40
 #define MBUS_CONTROL_MASK_SND_UD        0x53
+#define MBUS_CONTROL_MASK_REQ_UD2_9600  0x5C // Landis+Gyr special
 #define MBUS_CONTROL_MASK_REQ_UD2       0x5B
 #define MBUS_CONTROL_MASK_REQ_UD1       0x5A
 #define MBUS_CONTROL_MASK_RSP_UD        0x08
