@@ -97,13 +97,6 @@ typedef struct _mbus_frame {
 
 } mbus_frame;
 
-typedef struct _mbus_slave_data {
-
-    int state_fcb;
-    int state_acd;
-
-} mbus_slave_data;
-
 #define NITEMS(x) (sizeof(x)/sizeof(x[0]))
 
 //
@@ -164,11 +157,14 @@ typedef struct _mbus_data_record_header {
 
 } mbus_data_record_header;
 
+#define MBUS_DATA_VARIABLE_HEADER_LENGTH 12
+#define MBUS_DATA_RECORD_SIZE (MBUS_FRAME_DATA_LENGTH - MBUS_DATA_VARIABLE_HEADER_LENGTH - 1)
+
 typedef struct _mbus_data_record {
 
     mbus_data_record_header drh;
 
-    unsigned char data[234];
+    unsigned char data[MBUS_DATA_RECORD_SIZE];
     size_t data_len;
 
     time_t timestamp;
@@ -197,8 +193,6 @@ typedef struct _mbus_data_variable_header {
     unsigned char signature[2];      // 00 00
 
 } mbus_data_variable_header;
-
-#define MBUS_DATA_VARIABLE_HEADER_LENGTH 12
 
 //
 // VARIABLE LENGTH DATA FORMAT
@@ -523,6 +517,10 @@ unsigned int mbus_manufacturer_id(char *manufacturer);
 // it is useful to attach the appropriate code page for postprocessing.
 #define MBUS_XML_PROCESSING_INSTRUCTION         "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n"
 
+#define MBUS_XML_RECORD_BUFFER 4096
+
+#define MBUS_XML_BUFFER_MAX_SIZE (10 * 1024 * 1024)
+
 //
 // Event callback functions
 //
@@ -583,11 +581,6 @@ const char *mbus_data_record_value(mbus_data_record *record);
 //
 int mbus_frame_type(mbus_frame *frame);
 int mbus_frame_direction(mbus_frame *frame);
-
-//
-// Slave status data register.
-//
-mbus_slave_data *mbus_slave_data_get(size_t i);
 
 //
 // XML generating functions
@@ -657,6 +650,14 @@ const char *mbus_vif_unit_lookup(unsigned char vif);
 unsigned char mbus_dif_datalength_lookup(unsigned char dif);
 
 char *mbus_frame_get_secondary_address(mbus_frame *frame);
+
+/**
+ * Decodes the secondary addres into the given buffer.
+ * Note that mbus_frame_get_secondary_address() uses an internal static buffer
+ * which may not be desired in multi-threaded scenarios.
+ */
+char *mbus_frame_get_secondary_address_to_buffer(mbus_frame *frame, char *output_buffer, size_t output_buffer_size);
+
 int   mbus_frame_select_secondary_pack(mbus_frame *frame, char *address);
 
 int mbus_is_primary_address(int value);
