@@ -10,6 +10,8 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -55,11 +57,6 @@ mbus_manufacturer_id(char *manufacturer)
     return (0x0421 <= id && id <= 0x6b5a) ? id : 0;
 }
 
-//------------------------------------------------------------------------------
-// internal data
-//------------------------------------------------------------------------------
-static mbus_slave_data slave_data[MBUS_MAX_PRIMARY_SLAVES];
-
 //
 //  trace callbacks
 //
@@ -97,21 +94,6 @@ void
 mbus_error_reset()
 {
     snprintf(error_str, sizeof(error_str), "no errors");
-}
-
-//------------------------------------------------------------------------------
-/// Return a pointer to the slave_data register. This register can be used for
-/// storing current slave status.
-//------------------------------------------------------------------------------
-mbus_slave_data *
-mbus_slave_data_get(size_t i)
-{
-    if (i < MBUS_MAX_PRIMARY_SLAVES)
-    {
-        return &slave_data[i];
-    }
-
-    return NULL;
 }
 
 //------------------------------------------------------------------------------
@@ -501,6 +483,11 @@ mbus_data_bcd_decode(unsigned char *bcd_data, size_t bcd_data_size)
 
     if (bcd_data)
     {
+        if (bcd_data_size == 0 || bcd_data_size > 6)
+        {
+            return -1;
+        }
+
         for (i = bcd_data_size; i > 0; i--)
         {
             val = (val * 10);
@@ -536,7 +523,7 @@ mbus_data_bcd_decode_hex(unsigned char *bcd_data, size_t bcd_data_size)
     long long val = 0;
     size_t i;
 
-    if (bcd_data)
+    if (bcd_data && bcd_data_size <= 6)
     {
         for (i = bcd_data_size; i > 0; i--)
         {
@@ -768,6 +755,7 @@ void
 mbus_data_bin_decode(unsigned char *dst, const unsigned char *src, size_t len, size_t max_len)
 {
     size_t i, pos;
+    int ret;
 
     i = 0;
     pos = 0;
@@ -775,7 +763,14 @@ mbus_data_bin_decode(unsigned char *dst, const unsigned char *src, size_t len, s
     if (src && dst)
     {
         while((i < len) && ((pos+3) < max_len)) {
-            pos += snprintf(&dst[pos], max_len - pos, "%.2X ", src[i]);
+            ret = snprintf(&dst[pos], max_len - pos, "%.2X ", src[len - i - 1]);
+            if (ret < 0 || (size_t)ret >= max_len - pos)
+            {
+               dst[pos] = '\0';
+               return;
+            }
+
+            pos += ret;
             i++;
         }
 
@@ -805,6 +800,7 @@ mbus_data_bin_decode(unsigned char *dst, const unsigned char *src, size_t len, s
 void
 mbus_data_tm_decode(struct tm *t, unsigned char *t_data, size_t t_data_size)
 {
+    int year, hundred_year;
     if (t == NULL)
     {
         return;
@@ -844,8 +840,14 @@ mbus_data_tm_decode(struct tm *t, unsigned char *t_data, size_t t_data_size)
                 t->tm_hour  = t_data[1] & 0x1F;
                 t->tm_mday  = t_data[2] & 0x1F;
                 t->tm_mon   = (t_data[3] & 0x0F) - 1;
-                t->tm_year  = 100 + (((t_data[2] & 0xE0) >> 5) |
+                year = (((t_data[2] & 0xE0) >> 5) |
                               ((t_data[3] & 0xF0) >> 1));
+                hundred_year = (t_data[1] & 0x60) >> 5;
+                if (hundred_year == 0 && year <= 80)  //  compatibility with old meters with a circular two digit date
+                {
+                    hundred_year = 1;
+                }
+                t->tm_year  = 100 * hundred_year + year;
                 t->tm_isdst = (t_data[1] & 0x80) ? 1 : 0;  // day saving time
             }
         }
@@ -2304,6 +2306,12 @@ mbus_vif_unit_lookup(unsigned char vif)
                 else
                     offset = snprintf(buff, sizeof(buff), "Actuality Duration ");
 
+                if (offset < 0 || (size_t)offset >= sizeof(buff))
+                {
+                    buff[0] = 0;
+                    return buff;
+                }
+
                 switch (vif & 0x03)
                 {
                     case 0x00:
@@ -3101,12 +3109,21 @@ mbus_vib_unit_lookup(mbus_value_information_block *vib)
         snprintf(buff, sizeof(buff), "%s", vib->custom_vif);
         return buff;
     }
-    else if (vib->vif == 0xFC && (vib->vife[0] & 0x78) == 0x70)
+    else if (vib->vif == 0xFC)
     {
-        // custom VIF
-        n = (vib->vife[0] & 0x07);
-        snprintf(buff, sizeof(buff), "%s %s", mbus_unit_prefix(n-6), vib->custom_vif);
-        return buff;
+        // custom VIF with extensions
+        if ((vib->vife[0] & 0x78) == 0x70)
+        {
+            // E111 0nnn Multiplicative correction factor
+            n = (vib->vife[0] & 0x07);
+            snprintf(buff, sizeof(buff), "%s %s", mbus_unit_prefix(n-6), vib->custom_vif);
+            return buff;
+        }
+        else
+        {
+            snprintf(buff, sizeof(buff), "%s (with unsupported extensions)", vib->custom_vif);
+            return buff;
+        }
     }
 
     return mbus_vif_unit_lookup(vib->vif); // no extention, use VIF
@@ -3177,11 +3194,18 @@ mbus_data_record_decode(mbus_data_record *record)
                 // E110 1100  Time Point (date)
                 if (vif == 0x6C)
                 {
-                    mbus_data_tm_decode(&time, record->data, 2);
-                    snprintf(buff, sizeof(buff), "%04d-%02d-%02d",
-                                                 (time.tm_year + 1900),
-                                                 (time.tm_mon + 1),
-                                                  time.tm_mday);
+                    if (record->data[0] == 0xFF && record->data[1] == 0xFF)
+                    {
+                        buff[0] = '\0';
+                    }
+                    else
+                    {
+                        mbus_data_tm_decode(&time, record->data, 2);
+                        snprintf(buff, sizeof(buff), "%04d-%02d-%02d",
+                                                     (time.tm_year + 1900),
+                                                     (time.tm_mon + 1),
+                                                      time.tm_mday);
+                    }
                 }
                 else  // 2 byte integer
                 {
@@ -3289,8 +3313,16 @@ mbus_data_record_decode(mbus_data_record *record)
 
             case 0x09: // 2 digit BCD (8 bit)
 
-                int_val = (int)mbus_data_bcd_decode_hex(record->data, 1);
-                snprintf(buff, sizeof(buff), "%X", int_val);
+                if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_FUNCTION) == 0x30)
+                {
+                    int_val = (int)mbus_data_bcd_decode_hex(record->data, 1);
+                    snprintf(buff, sizeof(buff), "%X", int_val);
+                }
+                else
+                {
+                    int_val = (int)mbus_data_bcd_decode(record->data, 1);
+                    snprintf(buff, sizeof(buff), "%d", int_val);
+                }
 
                 if (debug)
                     printf("%s: DIF 0x%.2x was decoded using 2 digit BCD\n", __PRETTY_FUNCTION__, record->drh.dib.dif);
@@ -3299,8 +3331,16 @@ mbus_data_record_decode(mbus_data_record *record)
 
             case 0x0A: // 4 digit BCD (16 bit)
 
-                int_val = (int)mbus_data_bcd_decode_hex(record->data, 2);
-                snprintf(buff, sizeof(buff), "%X", int_val);
+                if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_FUNCTION) == 0x30)
+                {
+                    int_val = (int)mbus_data_bcd_decode_hex(record->data, 2);
+                    snprintf(buff, sizeof(buff), "%X", int_val);
+                }
+                else
+                {
+                    int_val = (int)mbus_data_bcd_decode(record->data, 2);
+                    snprintf(buff, sizeof(buff), "%d", int_val);
+                }
 
                 if (debug)
                     printf("%s: DIF 0x%.2x was decoded using 4 digit BCD\n", __PRETTY_FUNCTION__, record->drh.dib.dif);
@@ -3309,8 +3349,16 @@ mbus_data_record_decode(mbus_data_record *record)
 
             case 0x0B: // 6 digit BCD (24 bit)
 
-                int_val = (int)mbus_data_bcd_decode_hex(record->data, 3);
-                snprintf(buff, sizeof(buff), "%X", int_val);
+                if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_FUNCTION) == 0x30)
+                {
+                    int_val = (int)mbus_data_bcd_decode_hex(record->data, 3);
+                    snprintf(buff, sizeof(buff), "%X", int_val);
+                }
+                else
+                {
+                    int_val = (int)mbus_data_bcd_decode(record->data, 3);
+                    snprintf(buff, sizeof(buff), "%d", int_val);
+                }
 
                 if (debug)
                     printf("%s: DIF 0x%.2x was decoded using 6 digit BCD\n", __PRETTY_FUNCTION__, record->drh.dib.dif);
@@ -3319,8 +3367,16 @@ mbus_data_record_decode(mbus_data_record *record)
 
             case 0x0C: // 8 digit BCD (32 bit)
 
-                int_val = (int)mbus_data_bcd_decode_hex(record->data, 4);
-                snprintf(buff, sizeof(buff), "%X", int_val);
+                if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_FUNCTION) == 0x30)
+                {
+                    int_val = (int)mbus_data_bcd_decode_hex(record->data, 4);
+                    snprintf(buff, sizeof(buff), "%X", int_val);
+                }
+                else
+                {
+                    int_val = (int)mbus_data_bcd_decode(record->data, 4);
+                    snprintf(buff, sizeof(buff), "%d", int_val);
+                }
 
                 if (debug)
                     printf("%s: DIF 0x%.2x was decoded using 8 digit BCD\n", __PRETTY_FUNCTION__, record->drh.dib.dif);
@@ -3329,8 +3385,16 @@ mbus_data_record_decode(mbus_data_record *record)
 
             case 0x0E: // 12 digit BCD (48 bit)
 
-                long_long_val = mbus_data_bcd_decode_hex(record->data, 6);
-                snprintf(buff, sizeof(buff), "%llX", long_long_val);
+                if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_FUNCTION) == 0x30)
+                {
+                    long_long_val = mbus_data_bcd_decode_hex(record->data, 6);
+                    snprintf(buff, sizeof(buff), "%llX", long_long_val);
+                }
+                else
+                {
+                    long_long_val = mbus_data_bcd_decode(record->data, 6);
+                    snprintf(buff, sizeof(buff), "%lld", long_long_val);
+                }
 
                 if (debug)
                     printf("%s: DIF 0x%.2x was decoded using 12 digit BCD\n", __PRETTY_FUNCTION__, record->drh.dib.dif);
@@ -3343,9 +3407,14 @@ mbus_data_record_decode(mbus_data_record *record)
                 break;
 
             case 0x0D: // variable length
-                if (record->data_len <= 0xBF)
+                if (record->data[0] <= 0xBF)
                 {
-                    mbus_data_str_decode(buff, record->data, record->data_len);
+                    mbus_data_str_decode(buff, &record->data[1], record->data_len - 1);
+                    break;
+                }
+                else
+                {
+                    mbus_data_bin_decode(buff, &record->data[1], record->data_len - 1, sizeof(buff));
                     break;
                 }
                 /*@fallthrough@*/
@@ -3403,21 +3472,31 @@ mbus_data_record_value(mbus_data_record *record)
 long mbus_data_record_storage_number(mbus_data_record *record)
 {
     int bit_index = 0;
-    long result = 0;
+    uint64_t result = 0;
     int i;
 
     if (record)
     {
+        if (record->drh.dib.ndife > MBUS_DATA_INFO_BLOCK_DIFE_SIZE)
+        {
+            return -1;
+        }
+
         result |= (record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_STORAGE_NO) >> 6;
         bit_index++;
 
         for (i=0; i<record->drh.dib.ndife; i++)
         {
-            result |= (record->drh.dib.dife[i] & MBUS_DATA_RECORD_DIFE_MASK_STORAGE_NO) << bit_index;
+            result |= ((uint64_t)(record->drh.dib.dife[i] & MBUS_DATA_RECORD_DIFE_MASK_STORAGE_NO)) << bit_index;
             bit_index += 4;
         }
 
-        return result;
+        if (result > LONG_MAX)
+        {
+            return -1;
+        }
+
+        return (long)result;
     }
 
     return -1;
@@ -3432,8 +3511,13 @@ long mbus_data_record_tariff(mbus_data_record *record)
     long result = 0;
     int i;
 
-    if (record && (record->drh.dib.ndife > 0))
+    if (record)
     {
+        if (record->drh.dib.ndife == 0 || record->drh.dib.ndife > MBUS_DATA_INFO_BLOCK_DIFE_SIZE)
+        {
+            return -1;
+        }
+
         for (i=0; i<record->drh.dib.ndife; i++)
         {
             result |= ((record->drh.dib.dife[i] & MBUS_DATA_RECORD_DIFE_MASK_TARIFF) >> 4) << bit_index;
@@ -3455,8 +3539,13 @@ int mbus_data_record_device(mbus_data_record *record)
     int result = 0;
     int i;
 
-    if (record && (record->drh.dib.ndife > 0))
+    if (record)
     {
+        if (record->drh.dib.ndife == 0 || record->drh.dib.ndife > MBUS_DATA_INFO_BLOCK_DIFE_SIZE)
+        {
+            return -1;
+        }
+
         for (i=0; i<record->drh.dib.ndife; i++)
         {
             result |= ((record->drh.dib.dife[i] & MBUS_DATA_RECORD_DIFE_MASK_DEVICE) >> 6) << bit_index;
@@ -3735,8 +3824,8 @@ mbus_data_fixed_parse(mbus_frame *frame, mbus_data_fixed *data)
 //------------------------------------------------------------------------------
 /// Parse the variable-length data of a M-Bus frame
 //------------------------------------------------------------------------------
-int
-mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
+static int
+mbus_data_variable_parse_internal(mbus_frame *frame, mbus_data_variable *data, bool wrong_variable_length_vif_placement, bool *variable_length_vif_with_extension)
 {
     mbus_data_record *record = NULL;
     size_t i, j;
@@ -3781,7 +3870,8 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
             if ((record = mbus_data_record_new()) == NULL)
             {
-                // clean up...
+                mbus_data_record_free(data->record);
+                data->record = NULL;
                 return (-2);
             }
 
@@ -3820,13 +3910,15 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
             // read DIF extensions
             record->drh.dib.ndife = 0;
-            while ((i < frame->data_size) &&
+            while ((i + 1 < frame->data_size) &&
                    (frame->data[i] & MBUS_DIB_DIF_EXTENSION_BIT))
             {
                 unsigned char dife;
 
                 if (record->drh.dib.ndife >= MBUS_DATA_INFO_BLOCK_DIFE_SIZE)
                 {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
                     mbus_data_record_free(record);
                     snprintf(error_str, sizeof(error_str), "Too many DIFE.");
                     return -1;
@@ -3840,8 +3932,10 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
             }
             i++;
 
-            if (i > frame->data_size)
+            if (i >= frame->data_size)
             {
+                mbus_data_record_free(data->record);
+                data->record = NULL;
                 mbus_data_record_free(record);
                 snprintf(error_str, sizeof(error_str), "Premature end of record at DIF.");
                 return -1;
@@ -3851,14 +3945,28 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
             // VIF
             record->drh.vib.vif = frame->data[i++];
+            bool variable_length_vif = (record->drh.vib.vif & MBUS_DIB_VIF_WITHOUT_EXTENSION) == 0x7C;
+            *variable_length_vif_with_extension = record->drh.vib.vif == 0xFC;
 
-            if ((record->drh.vib.vif & MBUS_DIB_VIF_WITHOUT_EXTENSION) == 0x7C)
+            if (variable_length_vif && wrong_variable_length_vif_placement)
             {
                 // variable length VIF in ASCII format
                 int var_vif_len;
-                var_vif_len = frame->data[i++];
-                if (var_vif_len > MBUS_VALUE_INFO_BLOCK_CUSTOM_VIF_SIZE)
+
+                if (i >= frame->data_size)
                 {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Premature end of record at VIF.");
+                    return -1;
+                }
+
+                var_vif_len = frame->data[i++];
+                if (var_vif_len >= MBUS_VALUE_INFO_BLOCK_CUSTOM_VIF_SIZE)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
                     mbus_data_record_free(record);
                     snprintf(error_str, sizeof(error_str), "Too long variable length VIF.");
                     return -1;
@@ -3866,6 +3974,8 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
                 if (i + var_vif_len > frame->data_size)
                 {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
                     mbus_data_record_free(record);
                     snprintf(error_str, sizeof(error_str), "Premature end of record at variable length VIF.");
                     return -1;
@@ -3879,16 +3989,27 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
             if (record->drh.vib.vif & MBUS_DIB_VIF_EXTENSION_BIT)
             {
+                if (i >= frame->data_size)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Premature end of record at VIF.");
+                    return -1;
+                }
+
                 record->drh.vib.vife[0] = frame->data[i];
                 record->drh.vib.nvife++;
 
-                while ((i < frame->data_size) &&
+                while ((i + 1 < frame->data_size) &&
                        (frame->data[i] & MBUS_DIB_VIF_EXTENSION_BIT))
                 {
                     unsigned char vife;
 
                     if (record->drh.vib.nvife >= MBUS_VALUE_INFO_BLOCK_VIFE_SIZE)
                     {
+                        mbus_data_record_free(data->record);
+                        data->record = NULL;
                         mbus_data_record_free(record);
                         snprintf(error_str, sizeof(error_str), "Too many VIFE.");
                         return -1;
@@ -3905,28 +4026,83 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
 
             if (i > frame->data_size)
             {
+                mbus_data_record_free(data->record);
+                data->record = NULL;
                 mbus_data_record_free(record);
                 snprintf(error_str, sizeof(error_str), "Premature end of record at VIF.");
                 return -1;
             }
 
+            if (variable_length_vif && !wrong_variable_length_vif_placement)
+            {
+                // variable length VIF in ASCII format
+                int var_vif_len;
+
+                if (i >= frame->data_size)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Premature end of record at VIF.");
+                    return -1;
+                }
+
+                var_vif_len = frame->data[i++];
+                if (var_vif_len >= MBUS_VALUE_INFO_BLOCK_CUSTOM_VIF_SIZE)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Too long variable length VIF.");
+                    return -1;
+                }
+
+                if (i + var_vif_len > frame->data_size)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Premature end of record at variable length VIF.");
+                    return -1;
+                }
+                mbus_data_str_decode(record->drh.vib.custom_vif, &(frame->data[i]), var_vif_len);
+                i += var_vif_len;
+            }
+
             // re-calculate data length, if of variable length type
             if ((record->drh.dib.dif & MBUS_DATA_RECORD_DIF_MASK_DATA) == 0x0D) // flag for variable length data
             {
+                if (i >= frame->data_size)
+                {
+                    mbus_data_record_free(data->record);
+                    data->record = NULL;
+                    mbus_data_record_free(record);
+                    snprintf(error_str, sizeof(error_str), "Premature end of record at LVAR.");
+                    return -1;
+                }
+
                 if(frame->data[i] <= 0xBF)
-                    record->data_len = frame->data[i++];
-                else if(frame->data[i] >= 0xC0 && frame->data[i] <= 0xCF)
-                    record->data_len = (frame->data[i++] - 0xC0) * 2;
-                else if(frame->data[i] >= 0xD0 && frame->data[i] <= 0xDF)
-                    record->data_len = (frame->data[i++] - 0xD0) * 2;
+                    record->data_len = frame->data[i];
+                else if(frame->data[i] >= 0xC0 && frame->data[i] <= 0xC9)
+                    record->data_len = frame->data[i] - 0xC0;
+                else if(frame->data[i] >= 0xD0 && frame->data[i] <= 0xD9)
+                    record->data_len = frame->data[i] - 0xD0;
                 else if(frame->data[i] >= 0xE0 && frame->data[i] <= 0xEF)
-                    record->data_len = frame->data[i++] - 0xE0;
-                else if(frame->data[i] >= 0xF0 && frame->data[i] <= 0xFA)
-                    record->data_len = frame->data[i++] - 0xF0;
+                    record->data_len = frame->data[i] - 0xE0;
+                else if(frame->data[i] >= 0xF0 && frame->data[i] <= 0xF4)
+                    record->data_len = (frame->data[i] - 0xEC) * 4;
+                else if(frame->data[i] == 0xF5)
+                    record->data_len = 48;
+                else if(frame->data[i] == 0xF6)
+                    record->data_len = 64;
+                // keep the LVAR byte, which is required to determine the data type
+                record->data_len++;
             }
 
             if (i + record->data_len > frame->data_size)
             {
+                mbus_data_record_free(data->record);
+                data->record = NULL;
                 mbus_data_record_free(record);
                 snprintf(error_str, sizeof(error_str), "Premature end of record at data.");
                 return -1;
@@ -3947,6 +4123,25 @@ mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
     }
 
     return -1;
+}
+
+//------------------------------------------------------------------------------
+/// Parse the variable-length data of a M-Bus frame
+//------------------------------------------------------------------------------
+int
+mbus_data_variable_parse(mbus_frame *frame, mbus_data_variable *data)
+{
+    // Try with the specified placement of variable length VIF first
+    bool variable_length_vif_with_extension = false;
+    int ret = mbus_data_variable_parse_internal(frame, data, false, &variable_length_vif_with_extension);
+    if (!variable_length_vif_with_extension || ret == 0)
+    {
+        return ret;
+    }
+
+    // Make another attempt with the wrong placement when variable length VIF
+    // with extension is used (e.g. some ELV CMA10 use this wrong placement)
+    return mbus_data_variable_parse_internal(frame, data, true, &variable_length_vif_with_extension);
 }
 
 //------------------------------------------------------------------------------
@@ -4201,6 +4396,23 @@ mbus_frame_internal_pack(mbus_frame *frame, mbus_frame_data *frame_data)
             //
             for (record = frame_data->data_var.record; record; record = record->next)
             {
+                if (record->data_len > MBUS_DATA_RECORD_SIZE)
+                {
+                    return -5;
+                }
+
+                if ((record->drh.dib.ndife > MBUS_DATA_INFO_BLOCK_DIFE_SIZE) ||
+                    (record->drh.vib.nvife > MBUS_VALUE_INFO_BLOCK_VIFE_SIZE))
+                {
+                    return -4;
+                }
+
+                if (frame->data_size + 1 + record->drh.dib.ndife + 1 + record->drh.vib.nvife +
+                    record->data_len > MBUS_FRAME_DATA_LENGTH)
+                {
+                    return -3;
+                }
+
                 // pack DIF
                 if (parse_debug)
                     printf("%s: packing DIF [%zu]", __PRETTY_FUNCTION__, frame->data_size);
@@ -4259,7 +4471,7 @@ int
 mbus_frame_print(mbus_frame *frame)
 {
     mbus_frame *iter;
-    unsigned char data_buff[256];
+    unsigned char data_buff[261];
     int len, i;
 
     if (frame == NULL)
@@ -4267,7 +4479,7 @@ mbus_frame_print(mbus_frame *frame)
 
     for (iter = frame; iter; iter = iter->next)
     {
-        if ((len = mbus_frame_pack(iter, data_buff, sizeof(data_buff))) == -1)
+        if ((len = mbus_frame_pack(iter, data_buff, sizeof(data_buff))) < 0)
         {
             return -2;
         }
@@ -4369,6 +4581,11 @@ mbus_data_variable_print(mbus_data_variable *data)
                 printf("%s: VENDOR DATA [size=%zu] = ", __PRETTY_FUNCTION__, record->data_len);
                 for (j = 0; j < record->data_len; j++)
                 {
+                    if (j >= MBUS_DATA_RECORD_SIZE)
+                    {
+                        printf("Data size too long\n");
+                        break;
+                    }
                     printf("%.2X ", record->data[j]);
                 }
                 printf("\n");
@@ -4386,7 +4603,15 @@ mbus_data_variable_print(mbus_data_variable *data)
             // DIFE
             for (j = 0; j < record->drh.dib.ndife; j++)
             {
-                unsigned char dife = record->drh.dib.dife[j];
+                unsigned char dife;
+
+                if (j >= MBUS_DATA_INFO_BLOCK_DIFE_SIZE)
+                {
+                    printf("Invalid nDIFE = %zu\n", record->drh.dib.ndife);
+                    break;
+                }
+
+                dife = record->drh.dib.dife[j];
 
                 printf("DIFE[%zu]               = %.2X\n", j,  dife);
                 printf("DIFE[%zu].Extension     = %s\n",   j, (dife & MBUS_DATA_RECORD_DIFE_MASK_EXTENSION) ? "Yes" : "No");
@@ -4403,7 +4628,15 @@ mbus_data_variable_print(mbus_data_variable *data)
             // VIFE
             for (j = 0; j < record->drh.vib.nvife; j++)
             {
-                unsigned char vife = record->drh.vib.vife[j];
+                unsigned char vife;
+
+                if (j >= MBUS_VALUE_INFO_BLOCK_VIFE_SIZE)
+                {
+                    printf("Invalid nVIFE = %zu\n", record->drh.vib.nvife);
+                    break;
+                }
+
+                vife = record->drh.vib.vife[j];
 
                 printf("VIFE[%zu]           = %.2X\n", j,  vife);
                 printf("VIFE[%zu].Extension = %s\n",   j, (vife & MBUS_DIB_VIF_EXTENSION_BIT) ? "Yes" : "No");
@@ -4471,6 +4704,9 @@ mbus_hex_dump(const char *label, const char *buff, size_t len)
     time ( &rawtime );
     timeinfo = gmtime ( &rawtime );
 
+    if (timeinfo == NULL)
+        return;
+
     strftime(timestamp,21,"%Y-%m-%d %H:%M:%SZ",timeinfo);
     fprintf(stderr, "[%s] %s (%03zu):", timestamp, label, len);
 
@@ -4506,6 +4742,7 @@ int
 mbus_str_xml_encode(unsigned char *dst, const unsigned char *src, size_t max_len)
 {
     size_t i, len;
+    int ret;
 
     i = 0;
     len = 0;
@@ -4538,21 +4775,29 @@ mbus_str_xml_encode(unsigned char *dst, const unsigned char *src, size_t max_len
             switch (src[i])
             {
                 case '&':
-                    len += snprintf(&dst[len], max_len - len, "&amp;");
+                    ret = snprintf(&dst[len], max_len - len, "&amp;");
                     break;
                 case '<':
-                    len += snprintf(&dst[len], max_len - len, "&lt;");
+                    ret = snprintf(&dst[len], max_len - len, "&lt;");
                     break;
                 case '>':
-                    len += snprintf(&dst[len], max_len - len, "&gt;");
+                    ret = snprintf(&dst[len], max_len - len, "&gt;");
                     break;
                 case '"':
-                    len += snprintf(&dst[len], max_len - len, "&quot;");
+                    ret = snprintf(&dst[len], max_len - len, "&quot;");
                     break;
                 default:
-                    dst[len++] = src[i];
+                    dst[len] = src[i];
+                    ret = 1;
                     break;
             }
+
+            if (ret < 0 || (size_t)ret >= max_len - len)
+            {
+                dst[len] = '\0';
+                return -3;
+            }
+            len += ret;
         }
 
         i++;
@@ -4568,31 +4813,67 @@ mbus_str_xml_encode(unsigned char *dst, const unsigned char *src, size_t max_len
 char *
 mbus_data_variable_header_xml(mbus_data_variable_header *header)
 {
-    static char buff[8192];
+    static char buff[MBUS_XML_RECORD_BUFFER];
     char str_encoded[768];
     size_t len = 0;
+    int ret;
 
     if (header)
     {
-        len += snprintf(&buff[len], sizeof(buff) - len, "    <SlaveInformation>\n");
+        ret = snprintf(&buff[len], sizeof(buff) - len, "    <SlaveInformation>\n");
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Id>%llX</Id>\n", mbus_data_bcd_decode_hex(header->id_bcd, 4));
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Manufacturer>%s</Manufacturer>\n",
+        len += ret;
+
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Id>%llX</Id>\n", mbus_data_bcd_decode_hex(header->id_bcd, 4));
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
+
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Manufacturer>%s</Manufacturer>\n",
                 mbus_decode_manufacturer(header->manufacturer[0], header->manufacturer[1]));
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Version>%d</Version>\n", header->version);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
+        len += ret;
+
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Version>%d</Version>\n", header->version);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_product_name(header), sizeof(str_encoded));
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <ProductName>%s</ProductName>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <ProductName>%s</ProductName>\n", str_encoded);
-
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_variable_medium_lookup(header->medium), sizeof(str_encoded));
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Medium>%s</Medium>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Medium>%s</Medium>\n", str_encoded);
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <AccessNumber>%d</AccessNumber>\n", header->access_no);
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Status>%.2X</Status>\n", header->status);
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Signature>%.2X%.2X</Signature>\n", header->signature[1], header->signature[0]);
+        len += ret;
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <AccessNumber>%d</AccessNumber>\n", header->access_no);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
-        len += snprintf(&buff[len], sizeof(buff) - len, "    </SlaveInformation>\n\n");
+        len += ret;
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Status>%.2X</Status>\n", header->status);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Signature>%.2X%.2X</Signature>\n", header->signature[1], header->signature[0]);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
+        ret = snprintf(&buff[len], sizeof(buff) - len, "    </SlaveInformation>\n\n");
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
         return buff;
     }
@@ -4606,72 +4887,118 @@ mbus_data_variable_header_xml(mbus_data_variable_header *header)
 char *
 mbus_data_variable_record_xml(mbus_data_record *record, int record_cnt, int frame_cnt, mbus_data_variable_header *header)
 {
-    static char buff[8192];
+    static char buff[MBUS_XML_RECORD_BUFFER];
     char str_encoded[768];
     size_t len = 0;
     struct tm * timeinfo;
     char timestamp[22];
     long tariff;
+    int ret;
 
     if (record)
     {
         if (frame_cnt >= 0)
         {
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "    <DataRecord id=\"%d\" frame=\"%d\">\n",
-                            record_cnt, frame_cnt);
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "    <DataRecord id=\"%d\" frame=\"%d\">\n",
+                           record_cnt, frame_cnt);
         }
         else
         {
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "    <DataRecord id=\"%d\">\n", record_cnt);
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "    <DataRecord id=\"%d\">\n", record_cnt);
         }
+
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
 
         if (record->drh.dib.dif == MBUS_DIB_DIF_MANUFACTURER_SPECIFIC) // MBUS_DIB_DIF_VENDOR_SPECIFIC
         {
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <Function>Manufacturer specific</Function>\n");
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "        <Function>Manufacturer specific</Function>\n");
+            if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                return "";
+
+            len += ret;
         }
         else if (record->drh.dib.dif == MBUS_DIB_DIF_MORE_RECORDS_FOLLOW)
         {
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <Function>More records follow</Function>\n");
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "        <Function>More records follow</Function>\n");
+            if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                return "";
+
+            len += ret;
         }
         else
         {
             mbus_str_xml_encode(str_encoded, mbus_data_record_function(record), sizeof(str_encoded));
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <Function>%s</Function>\n", str_encoded);
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "        <Function>%s</Function>\n", str_encoded);
+            if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                return "";
 
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <StorageNumber>%ld</StorageNumber>\n",
-                            mbus_data_record_storage_number(record));
+            len += ret;
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "        <StorageNumber>%ld</StorageNumber>\n",
+                           mbus_data_record_storage_number(record));
+            if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                return "";
+
+            len += ret;
 
             if ((tariff = mbus_data_record_tariff(record)) >= 0)
             {
-                len += snprintf(&buff[len], sizeof(buff) - len, "        <Tariff>%ld</Tariff>\n",
-                                tariff);
-                len += snprintf(&buff[len], sizeof(buff) - len, "        <Device>%d</Device>\n",
-                                mbus_data_record_device(record));
+                ret = snprintf(&buff[len], sizeof(buff) - len, "        <Tariff>%ld</Tariff>\n",
+                               tariff);
+                if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                    return "";
+
+                len += ret;
+                ret = snprintf(&buff[len], sizeof(buff) - len, "        <Device>%d</Device>\n",
+                               mbus_data_record_device(record));
+                if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                    return "";
+
+                len += ret;
             }
 
             mbus_str_xml_encode(str_encoded, mbus_data_record_unit(record), sizeof(str_encoded));
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <Unit>%s</Unit>\n", str_encoded);
+            ret = snprintf(&buff[len], sizeof(buff) - len,
+                           "        <Unit>%s</Unit>\n", str_encoded);
+            if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                return "";
+
+            len += ret;
         }
 
         mbus_str_xml_encode(str_encoded, mbus_data_record_value(record), sizeof(str_encoded));
-        len += snprintf(&buff[len], sizeof(buff) - len, "        <Value>%s</Value>\n", str_encoded);
+        ret = snprintf(&buff[len], sizeof(buff) - len, "        <Value>%s</Value>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
+
+        len += ret;
 
         if (record->timestamp > 0)
         {
             timeinfo = gmtime (&(record->timestamp));
-            strftime(timestamp,21,"%Y-%m-%dT%H:%M:%SZ",timeinfo);
-            len += snprintf(&buff[len], sizeof(buff) - len,
-                            "        <Timestamp>%s</Timestamp>\n", timestamp);
+            if (timeinfo)
+            {
+                strftime(timestamp,21,"%Y-%m-%dT%H:%M:%SZ",timeinfo);
+                ret = snprintf(&buff[len], sizeof(buff) - len,
+                               "        <Timestamp>%s</Timestamp>\n", timestamp);
+                if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+                    return "";
+
+                len += ret;
+            }
         }
 
-        len += snprintf(&buff[len], sizeof(buff) - len, "    </DataRecord>\n\n");
+        ret = snprintf(&buff[len], sizeof(buff) - len, "    </DataRecord>\n\n");
+        if (ret < 0 || (size_t)ret >= sizeof(buff) - len)
+            return "";
 
         return buff;
     }
@@ -4687,8 +5014,8 @@ mbus_data_variable_xml(mbus_data_variable *data)
 {
     mbus_data_record *record;
     char *buff = NULL, *new_buff;
-    size_t len = 0, buff_size = 8192;
-    int i;
+    size_t len = 0, buff_size = MBUS_XML_RECORD_BUFFER * 2;
+    int i, ret;
 
     if (data)
     {
@@ -4697,18 +5024,43 @@ mbus_data_variable_xml(mbus_data_variable *data)
         if (buff == NULL)
             return NULL;
 
-        len += snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        ret = snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "%s",
-                        mbus_data_variable_header_xml(&(data->header)));
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "%s",
+                            mbus_data_variable_header_xml(&(data->header)));
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
 
         for (record = data->record, i = 0; record; record = record->next, i++)
         {
-            if ((buff_size - len) < 1024)
+            if ((buff_size - len) < MBUS_XML_RECORD_BUFFER)
             {
                 buff_size *= 2;
+                if (buff_size > MBUS_XML_BUFFER_MAX_SIZE)
+                {
+                    free(buff);
+                    return NULL;
+                }
+
                 new_buff = (char*) realloc(buff,buff_size);
 
                 if (new_buff == NULL)
@@ -4720,10 +5072,20 @@ mbus_data_variable_xml(mbus_data_variable *data)
                 buff = new_buff;
             }
 
-            len += snprintf(&buff[len], buff_size - len, "%s",
-                            mbus_data_variable_record_xml(record, i, -1, &(data->header)));
+            ret = snprintf(&buff[len], buff_size - len, "%s",
+                                mbus_data_variable_record_xml(record, i, -1, &(data->header)));
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                return NULL;
+            }
+
+            len += ret;
         }
-        len += snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+
+        ret = snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+            return NULL;
 
         return buff;
     }
@@ -4739,8 +5101,8 @@ mbus_data_fixed_xml(mbus_data_fixed *data)
 {
     char *buff = NULL;
     char str_encoded[256];
-    size_t len = 0, buff_size = 8192;
-    int val;
+    size_t len = 0, buff_size = MBUS_XML_RECORD_BUFFER * 2;
+    int ret, val;
 
     if (data)
     {
@@ -4749,59 +5111,181 @@ mbus_data_fixed_xml(mbus_data_fixed *data)
         if (buff == NULL)
             return NULL;
 
-        len += snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        ret = snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "    <SlaveInformation>\n");
-        len += snprintf(&buff[len], buff_size - len, "        <Id>%llX</Id>\n", mbus_data_bcd_decode_hex(data->id_bcd, 4));
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    <SlaveInformation>\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "        <Id>%llX</Id>\n", mbus_data_bcd_decode_hex(data->id_bcd, 4));
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_fixed_medium(data), sizeof(str_encoded));
-        len += snprintf(&buff[len], buff_size - len, "        <Medium>%s</Medium>\n", str_encoded);
+        ret = snprintf(&buff[len], buff_size - len, "        <Medium>%s</Medium>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "        <AccessNumber>%d</AccessNumber>\n", data->tx_cnt);
-        len += snprintf(&buff[len], buff_size - len, "        <Status>%.2X</Status>\n", data->status);
-        len += snprintf(&buff[len], buff_size - len, "    </SlaveInformation>\n\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "        <AccessNumber>%d</AccessNumber>\n", data->tx_cnt);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"0\">\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "        <Status>%.2X</Status>\n", data->status);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    </SlaveInformation>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"0\">\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_fixed_function(data->status), sizeof(str_encoded));
-        len += snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+        ret = snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_fixed_unit(data->cnt1_type), sizeof(str_encoded));
-        len += snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
+        ret = snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
+
         if ((data->status & MBUS_DATA_FIXED_STATUS_FORMAT_MASK) == MBUS_DATA_FIXED_STATUS_FORMAT_BCD)
         {
-            len += snprintf(&buff[len], buff_size - len, "        <Value>%llX</Value>\n", mbus_data_bcd_decode_hex(data->cnt1_val, 4));
+            ret = snprintf(&buff[len], buff_size - len, "        <Value>%llX</Value>\n", mbus_data_bcd_decode_hex(data->cnt1_val, 4));
         }
         else
         {
             mbus_data_int_decode(data->cnt1_val, 4, &val);
-            len += snprintf(&buff[len], buff_size - len, "        <Value>%d</Value>\n", val);
+            ret = snprintf(&buff[len], buff_size - len, "        <Value>%d</Value>\n", val);
         }
 
-        len += snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"1\">\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"1\">\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_fixed_function(data->status), sizeof(str_encoded));
-        len += snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+        ret = snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
+        len += ret;
         mbus_str_xml_encode(str_encoded, mbus_data_fixed_unit(data->cnt2_type), sizeof(str_encoded));
-        len += snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
+        ret = snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
+
         if ((data->status & MBUS_DATA_FIXED_STATUS_FORMAT_MASK) == MBUS_DATA_FIXED_STATUS_FORMAT_BCD)
         {
-            len += snprintf(&buff[len], buff_size - len, "        <Value>%llX</Value>\n", mbus_data_bcd_decode_hex(data->cnt2_val, 4));
+            ret = snprintf(&buff[len], buff_size - len, "        <Value>%llX</Value>\n", mbus_data_bcd_decode_hex(data->cnt2_val, 4));
         }
         else
         {
             mbus_data_int_decode(data->cnt2_val, 4, &val);
-            len += snprintf(&buff[len], buff_size - len, "        <Value>%d</Value>\n", val);
+            ret = snprintf(&buff[len], buff_size - len, "        <Value>%d</Value>\n", val);
         }
 
-        len += snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
         return buff;
     }
@@ -4817,24 +5301,62 @@ mbus_data_error_xml(int error)
 {
     char *buff = NULL;
     char str_encoded[256];
-    size_t len = 0, buff_size = 8192;
+    size_t len = 0, buff_size = MBUS_XML_RECORD_BUFFER;
+    int ret;
 
     buff = (char*) malloc(buff_size);
 
     if (buff == NULL)
         return NULL;
 
-    len += snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
-    len += snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+    ret = snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
 
-    len += snprintf(&buff[len], buff_size - len, "    <SlaveInformation>\n");
+    len += ret;
+    ret = snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
+
+    len += ret;
+    ret = snprintf(&buff[len], buff_size - len, "    <SlaveInformation>\n");
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
+
+    len += ret;
 
     mbus_str_xml_encode(str_encoded, mbus_data_error_lookup(error), sizeof(str_encoded));
-    len += snprintf(&buff[len], buff_size - len, "        <Error>%s</Error>\n", str_encoded);
+    ret = snprintf(&buff[len], buff_size - len, "        <Error>%s</Error>\n", str_encoded);
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
 
-    len += snprintf(&buff[len], buff_size - len, "    </SlaveInformation>\n\n");
+    len += ret;
+    ret = snprintf(&buff[len], buff_size - len, "    </SlaveInformation>\n\n");
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
 
-    len += snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+    len += ret;
+    ret = snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+    if (ret < 0 || (size_t)ret >= buff_size - len)
+    {
+        free(buff);
+        return NULL;
+    }
 
     return buff;
 }
@@ -4879,8 +5401,8 @@ mbus_frame_xml(mbus_frame *frame)
     mbus_data_record *record;
     char *buff = NULL, *new_buff;
 
-    size_t len = 0, buff_size = 8192;
-    int record_cnt = 0, frame_cnt;
+    size_t len = 0, buff_size = MBUS_XML_RECORD_BUFFER * 2;
+    int record_cnt = 0, frame_cnt, ret;
 
     if (frame)
     {
@@ -4925,24 +5447,53 @@ mbus_frame_xml(mbus_frame *frame)
             // include frame counter in XML output if more than one frame
             // is available (frame_cnt = -1 => not included in output)
             frame_cnt = (frame->next == NULL) ? -1 : 0;
+            ret = snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                mbus_data_record_free(frame_data.data_var.record);
+                return NULL;
+            }
 
-            len += snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+            len += ret;
+            ret = snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                mbus_data_record_free(frame_data.data_var.record);
+                return NULL;
+            }
 
-            len += snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+            len += ret;
 
             // only print the header info for the first frame (should be
             // the same for each frame in a sequence of a multi-telegram
             // transfer.
-            len += snprintf(&buff[len], buff_size - len, "%s",
-                                    mbus_data_variable_header_xml(&(frame_data.data_var.header)));
+            ret = snprintf(&buff[len], buff_size - len, "%s",
+                                mbus_data_variable_header_xml(&(frame_data.data_var.header)));
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                mbus_data_record_free(frame_data.data_var.record);
+                return NULL;
+            }
+
+            len += ret;
 
             // loop through all records in the current frame, using a global
             // record count as record ID in the XML output
             for (record = frame_data.data_var.record; record; record = record->next, record_cnt++)
             {
-                if ((buff_size - len) < 1024)
+                if ((buff_size - len) < MBUS_XML_RECORD_BUFFER)
                 {
                     buff_size *= 2;
+                    if (buff_size > MBUS_XML_BUFFER_MAX_SIZE)
+                    {
+                        free(buff);
+                        mbus_data_record_free(frame_data.data_var.record);
+                        return NULL;
+                    }
+
                     new_buff = (char*) realloc(buff,buff_size);
 
                     if (new_buff == NULL)
@@ -4955,14 +5506,23 @@ mbus_frame_xml(mbus_frame *frame)
                     buff = new_buff;
                 }
 
-                len += snprintf(&buff[len], buff_size - len, "%s",
+                ret = snprintf(&buff[len], buff_size - len, "%s",
                                 mbus_data_variable_record_xml(record, record_cnt, frame_cnt, &(frame_data.data_var.header)));
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    free(buff);
+                    mbus_data_record_free(frame_data.data_var.record);
+                    return NULL;
+                }
+
+                len += ret;
             }
 
             // free all records in the list
             if (frame_data.data_var.record)
             {
                 mbus_data_record_free(frame_data.data_var.record);
+                frame_data.data_var.record = NULL;
             }
 
             frame_cnt++;
@@ -4979,9 +5539,16 @@ mbus_frame_xml(mbus_frame *frame)
                 // record count as record ID in the XML output
                 for (record = frame_data.data_var.record; record; record = record->next, record_cnt++)
                 {
-                    if ((buff_size - len) < 1024)
+                    if ((buff_size - len) < MBUS_XML_RECORD_BUFFER)
                     {
                         buff_size *= 2;
+                        if (buff_size > MBUS_XML_BUFFER_MAX_SIZE)
+                        {
+                            free(buff);
+                            mbus_data_record_free(frame_data.data_var.record);
+                            return NULL;
+                        }
+
                         new_buff = (char*) realloc(buff,buff_size);
 
                         if (new_buff == NULL)
@@ -4994,18 +5561,32 @@ mbus_frame_xml(mbus_frame *frame)
                         buff = new_buff;
                     }
 
-                    len += snprintf(&buff[len], buff_size - len, "%s",
-                                    mbus_data_variable_record_xml(record, record_cnt, frame_cnt, &(frame_data.data_var.header)));
+                    ret = snprintf(&buff[len], buff_size - len, "%s",
+                                        mbus_data_variable_record_xml(record, record_cnt, frame_cnt, &(frame_data.data_var.header)));
+                    if (ret < 0 || (size_t)ret >= buff_size - len)
+                    {
+                        free(buff);
+                        mbus_data_record_free(frame_data.data_var.record);
+                        return NULL;
+                    }
+
+                    len += ret;
                 }
 
                 // free all records in the list
                 if (frame_data.data_var.record)
                 {
                     mbus_data_record_free(frame_data.data_var.record);
+                    frame_data.data_var.record = NULL;
                 }
             }
 
-            len += snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+            ret = snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                return NULL;
+            }
 
             return buff;
         }
@@ -5126,8 +5707,20 @@ char *
 mbus_frame_get_secondary_address(mbus_frame *frame)
 {
     static char addr[32];
+    return mbus_frame_get_secondary_address_to_buffer(frame, addr, sizeof(addr));
+}
+
+char *
+mbus_frame_get_secondary_address_to_buffer(mbus_frame *frame, char *output_buffer, size_t output_buffer_size)
+{
     mbus_frame_data *data;
     unsigned long id;
+
+    if (output_buffer_size < 17)
+    {
+        snprintf(error_str, sizeof(error_str), "Output buffer size needs to be at least 17, got %zu.", output_buffer_size);
+        return NULL;
+    }
 
     if (frame == NULL || (data = mbus_frame_data_new()) == NULL)
     {
@@ -5152,7 +5745,7 @@ mbus_frame_get_secondary_address(mbus_frame *frame)
 
     id = (unsigned long) mbus_data_bcd_decode_hex(data->data_var.header.id_bcd, 4);
 
-    snprintf(addr, sizeof(addr), "%08lX%02X%02X%02X%02X",
+    snprintf(output_buffer, output_buffer_size, "%08lX%02X%02X%02X%02X",
              id,
              data->data_var.header.manufacturer[0],
              data->data_var.header.manufacturer[1],
@@ -5162,7 +5755,7 @@ mbus_frame_get_secondary_address(mbus_frame *frame)
     // free data
     mbus_frame_data_free(data);
 
-    return addr;
+    return output_buffer;
 }
 
 //------------------------------------------------------------------------------

@@ -778,9 +778,14 @@ mbus_register_scan_progress(mbus_handle * handle, void (*event)(mbus_handle * ha
 /// Register a function for the found events.
 //------------------------------------------------------------------------------
 void
-mbus_register_found_event(mbus_handle * handle, void (*event)(mbus_handle * handle, mbus_frame *frame))
+mbus_register_found_event(mbus_handle * handle, void (*event)(mbus_handle * handle, mbus_frame *frame, const char *address))
 {
     handle->found_event = event;
+}
+
+void mbus_register_abort_scan_check(mbus_handle *handle, bool (*abort_scan_check)(struct _mbus_handle *handle))
+{
+    handle->abort_scan_check = abort_scan_check;
 }
 
 int mbus_fixed_normalize(int medium_unit, long medium_value, char **unit_out, double *value_out, char **quantity_out)
@@ -867,16 +872,23 @@ int mbus_variable_value_decode(mbus_data_record *record, double *value_out_real,
                 // E110 1100  Time Point (date)
                 if (vif == 0x6C)
                 {
-                    mbus_data_tm_decode(&time, record->data, 2);
                     if ((*value_out_str = (char*) malloc(11)) == NULL)
                     {
                         MBUS_ERROR("Unable to allocate memory");
                         return -1;
                     }
-                    *value_out_str_size = snprintf(*value_out_str, 11, "%04d-%02d-%02d",
-                                                 (time.tm_year + 1900),
-                                                 (time.tm_mon + 1),
-                                                  time.tm_mday);
+                    if (record->data[0] == 0xFF && record->data[1] == 0xFF)
+                    {
+                        (*value_out_str)[0] = '\0';
+                    }
+                    else
+                    {
+                        mbus_data_tm_decode(&time, record->data, 2);
+                        *value_out_str_size = snprintf(*value_out_str, 11, "%04d-%02d-%02d",
+                                                     (time.tm_year + 1900),
+                                                     (time.tm_mon + 1),
+                                                      time.tm_mday);
+                    }
                     result = 0;
                 }
                 else  // normal integer
@@ -983,19 +995,30 @@ int mbus_variable_value_decode(mbus_data_record *record, double *value_out_real,
 
             case 0x0D: /* variable length */
             {
-                if (record->data_len <= 0xBF) {
-                    if ((*value_out_str = (char*) malloc(record->data_len + 1)) == NULL)
+                if (record->data[0] <= 0xBF) /* ascii string */
+                {
+                    /* we create a buffer the size of data_len (minus 1 because we skip the LVAR byte, plus 1 for the terminating 0) */
+                    if ((*value_out_str = (char*) malloc(record->data_len)) == NULL)
                     {
                         MBUS_ERROR("Unable to allocate memory");
                         return -1;
                     }
-                    *value_out_str_size = record->data_len;
-                    mbus_data_str_decode((unsigned char*)(*value_out_str), record->data, record->data_len);
-                    result = 0;
+                    *value_out_str_size = record->data_len - 1;
+                    mbus_data_str_decode((unsigned char*)(*value_out_str), &record->data[1], record->data_len - 1);
+                }
+                else /* binary or BCD (printed as binary for now) */
+                {
+                    /* We create a buffer of 3 bytes per printed byte (2 nibbles + space), plus a terminating 0. We are not printing the LVAR byte value. */
+                    if ((*value_out_str = (char*) malloc(3 * (record->data_len - 1) + 1)) == NULL)
+                    {
+                        MBUS_ERROR("Unable to allocate memory");
+                        return -1;
+                    }
+                    *value_out_str_size = 3 * (record->data_len - 1);
+                    mbus_data_bin_decode((unsigned char*)(*value_out_str), &record->data[1], record->data_len - 1, 3 * (record->data_len - 1) + 1);
                     break;
                 }
-                result = -2;
-                MBUS_ERROR("Non ASCII variable length not implemented yet\n");
+                result = 0;
                 break;
             }
 
@@ -1350,6 +1373,7 @@ mbus_parse_variable_record(mbus_data_record *data)
         if (mbus_vib_unit_normalize(&(data->drh.vib), value_out_real, &(record->unit), &real_val, &(record->quantity)) != 0)
         {
             MBUS_ERROR("%s: problem with mbus_vib_unit_normalize\n", __PRETTY_FUNCTION__);
+            free(value_out_str);
             mbus_record_free(record);
             record = NULL;
             return NULL;
@@ -1383,8 +1407,9 @@ mbus_data_variable_xml_normalized(mbus_data_variable *data)
     mbus_record *norm_record;
     char *buff = NULL, *new_buff = NULL;
     char str_encoded[768] = "";
-    size_t len = 0, buff_size = 8192;
+    size_t len = 0, buff_size = MBUS_XML_RECORD_BUFFER * 2;
     size_t i;
+    int ret;
 
     if (data)
     {
@@ -1393,19 +1418,45 @@ mbus_data_variable_xml_normalized(mbus_data_variable *data)
         if (buff == NULL)
             return NULL;
 
-        len += snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        ret = snprintf(&buff[len], buff_size - len, MBUS_XML_PROCESSING_INSTRUCTION);
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "<MBusData>\n\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
-        len += snprintf(&buff[len], buff_size - len, "%s", mbus_data_variable_header_xml(&(data->header)));
+        len += ret;
+        ret = snprintf(&buff[len], buff_size - len, "%s", mbus_data_variable_header_xml(&(data->header)));
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
+
+        len += ret;
 
         for (record = data->record, i = 0; record; record = record->next, i++)
         {
             norm_record = mbus_parse_variable_record(record);
 
-            if ((buff_size - len) < 1024)
+            if ((buff_size - len) < MBUS_XML_RECORD_BUFFER)
             {
                 buff_size *= 2;
+                if (buff_size > MBUS_XML_BUFFER_MAX_SIZE)
+                {
+                    mbus_record_free(norm_record);
+                    free(buff);
+                    return NULL;
+                }
+
                 new_buff = (char*) realloc(buff,buff_size);
 
                 if (new_buff == NULL)
@@ -1418,49 +1469,121 @@ mbus_data_variable_xml_normalized(mbus_data_variable *data)
                 buff = new_buff;
             }
 
-            len += snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"%zu\">\n", i);
+            ret = snprintf(&buff[len], buff_size - len, "    <DataRecord id=\"%zu\">\n", i);
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                mbus_record_free(norm_record);
+                free(buff);
+                return NULL;
+            }
+
+            len += ret;
 
             if (norm_record != NULL)
             {
                 mbus_str_xml_encode(str_encoded, norm_record->function_medium, sizeof(str_encoded));
-                len += snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+                ret = snprintf(&buff[len], buff_size - len, "        <Function>%s</Function>\n", str_encoded);
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    mbus_record_free(norm_record);
+                    free(buff);
+                    return NULL;
+                }
 
-                len += snprintf(&buff[len], buff_size - len, "        <StorageNumber>%ld</StorageNumber>\n", norm_record->storage_number);
+                len += ret;
+                ret = snprintf(&buff[len], buff_size - len, "        <StorageNumber>%ld</StorageNumber>\n", norm_record->storage_number);
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    mbus_record_free(norm_record);
+                    free(buff);
+                    return NULL;
+                }
+
+                len += ret;
 
                 if (norm_record->tariff >= 0)
                 {
-                    len += snprintf(&buff[len], buff_size - len, "        <Tariff>%ld</Tariff>\n", norm_record->tariff);
-                    len += snprintf(&buff[len], buff_size - len, "        <Device>%d</Device>\n", norm_record->device);
+                    ret = snprintf(&buff[len], buff_size - len, "        <Tariff>%ld</Tariff>\n", norm_record->tariff);
+                    if (ret < 0 || (size_t)ret >= buff_size - len)
+                    {
+                        mbus_record_free(norm_record);
+                        free(buff);
+                        return NULL;
+                    }
+
+                    len += ret;
+                    ret = snprintf(&buff[len], buff_size - len, "        <Device>%d</Device>\n", norm_record->device);
+                    if (ret < 0 || (size_t)ret >= buff_size - len)
+                    {
+                        mbus_record_free(norm_record);
+                        free(buff);
+                        return NULL;
+                    }
+
+                    len += ret;
                 }
 
                 mbus_str_xml_encode(str_encoded, norm_record->unit, sizeof(str_encoded));
+                ret = snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    mbus_record_free(norm_record);
+                    free(buff);
+                    return NULL;
+                }
 
-                len += snprintf(&buff[len], buff_size - len, "        <Unit>%s</Unit>\n", str_encoded);
-
+                len += ret;
                 mbus_str_xml_encode(str_encoded, norm_record->quantity, sizeof(str_encoded));
-                len += snprintf(&buff[len], buff_size - len, "        <Quantity>%s</Quantity>\n", str_encoded);
+                ret = snprintf(&buff[len], buff_size - len, "        <Quantity>%s</Quantity>\n", str_encoded);
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    mbus_record_free(norm_record);
+                    free(buff);
+                    return NULL;
+                }
 
+                len += ret;
 
                 if (norm_record->is_numeric)
                 {
-                    len += snprintf(&buff[len], buff_size - len, "        <Value>%f</Value>\n", norm_record->value.real_val);
+                    ret = snprintf(&buff[len], buff_size - len, "        <Value>%f</Value>\n", norm_record->value.real_val);
                 }
                 else
                 {
                     mbus_str_xml_encode(str_encoded, norm_record->value.str_val.value, sizeof(str_encoded));
-                    len += snprintf(&buff[len], buff_size - len, "        <Value>%s</Value>\n", str_encoded);
+                    ret = snprintf(&buff[len], buff_size - len, "        <Value>%s</Value>\n", str_encoded);
                 }
 
                 mbus_record_free(norm_record);
+
+                if (ret < 0 || (size_t)ret >= buff_size - len)
+                {
+                    free(buff);
+                    return NULL;
+                }
+
+                len += ret;
             }
             else
             {
             }
 
-            len += snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+            ret = snprintf(&buff[len], buff_size - len, "    </DataRecord>\n\n");
+            if (ret < 0 || (size_t)ret >= buff_size - len)
+            {
+                free(buff);
+                return NULL;
+            }
+
+            len += ret;
         }
 
-        len += snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+        ret = snprintf(&buff[len], buff_size - len, "</MBusData>\n");
+        if (ret < 0 || (size_t)ret >= buff_size - len)
+        {
+            free(buff);
+            return NULL;
+        }
 
         return buff;
     }
@@ -1516,6 +1639,7 @@ mbus_context_serial(const char *device)
     handle->is_serial = 1;
     handle->purge_first_frame = MBUS_FRAME_PURGE_M2S;
     handle->auxdata = serial_data;
+    handle->userdata = NULL;
     handle->open = mbus_serial_connect;
     handle->close = mbus_serial_disconnect;
     handle->recv = mbus_serial_recv_frame;
@@ -1525,6 +1649,7 @@ mbus_context_serial(const char *device)
     handle->send_event = NULL;
     handle->scan_progress = NULL;
     handle->found_event = NULL;
+    handle->abort_scan_check = NULL;
 
     if ((serial_data->device = strdup(device)) == NULL)
     {
@@ -1564,6 +1689,7 @@ mbus_context_tcp(const char *host, uint16_t port)
     handle->is_serial = 0;
     handle->purge_first_frame = MBUS_FRAME_PURGE_M2S;
     handle->auxdata = tcp_data;
+    handle->userdata = NULL;
     handle->open = mbus_tcp_connect;
     handle->close = mbus_tcp_disconnect;
     handle->recv = mbus_tcp_recv_frame;
@@ -1573,6 +1699,7 @@ mbus_context_tcp(const char *host, uint16_t port)
     handle->send_event = NULL;
     handle->scan_progress = NULL;
     handle->found_event = NULL;
+    handle->abort_scan_check = NULL;
 
     tcp_data->port = port;
     if ((tcp_data->host = strdup(host)) == NULL)
@@ -1658,6 +1785,19 @@ mbus_context_set_option(mbus_handle * handle, mbus_context_option option, long v
     }
 
     return -1; // unable to set option
+}
+
+int
+mbus_context_set_userdata(mbus_handle * handle, void *userdata)
+{
+    if (handle == NULL)
+    {
+        MBUS_ERROR("%s: Invalid M-Bus handle to set userdata.\n", __PRETTY_FUNCTION__);
+        return -1;
+    }
+
+    handle->userdata = userdata;
+    return 0;
 }
 
 int
@@ -2320,7 +2460,8 @@ mbus_probe_secondary_address(mbus_handle *handle, const char *mask, char *matchi
 
             if (mbus_frame_type(&reply) == MBUS_FRAME_TYPE_LONG)
             {
-                char *addr = mbus_frame_get_secondary_address(&reply);
+                char addr_buffer[32];
+                char *addr = mbus_frame_get_secondary_address_to_buffer(&reply, addr_buffer, sizeof(addr_buffer));
 
                 if (addr == NULL)
                 {
@@ -2334,7 +2475,7 @@ mbus_probe_secondary_address(mbus_handle *handle, const char *mask, char *matchi
 
                 if (handle->found_event)
                 {
-                    handle->found_event(handle,&reply);
+                    handle->found_event(handle,&reply,addr);
                 }
 
                 return MBUS_PROBE_SINGLE;
@@ -2432,8 +2573,8 @@ int mbus_read_slave(mbus_handle * handle, mbus_address *address, mbus_frame * re
 //------------------------------------------------------------------------------
 // Iterate over all address masks according to the M-Bus probe algorithm.
 //------------------------------------------------------------------------------
-int
-mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
+static int
+mbus_scan_2nd_address_range_internal(mbus_handle * handle, int pos, const char *addr_mask, bool *aborted)
 {
     int i, i_start, i_end, probe_ret;
     char *mask, matching_mask[17];
@@ -2472,7 +2613,17 @@ mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
         if (pos < 15)
         {
             // mask[pos] is not a wildcard -> don't iterate, recursively check pos+1
-            mbus_scan_2nd_address_range(handle, pos+1, mask);
+            mbus_scan_2nd_address_range_internal(handle, pos+1, mask, aborted);
+
+            if (*aborted)
+            {
+                free(mask);
+                return 0;
+            }
+
+            // Initialize to silence a false-positive compile warning on gcc
+            i_start = 0;
+            i_end = 0;
         }
         else
         {
@@ -2489,6 +2640,13 @@ mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
         {
             mask[pos] = '0'+i;
 
+            if (handle->abort_scan_check && handle->abort_scan_check(handle))
+            {
+                *aborted = true; // To abort all recursive calls
+                free(mask);
+                return 0;
+            }
+
             if (handle->scan_progress)
                 handle->scan_progress(handle,mask);
 
@@ -2504,7 +2662,13 @@ mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
             else if (probe_ret == MBUS_PROBE_COLLISION)
             {
                 // collision, more than one device matching, restrict the search mask further
-                mbus_scan_2nd_address_range(handle, pos+1, mask);
+                mbus_scan_2nd_address_range_internal(handle, pos+1, mask, aborted);
+
+                if (*aborted)
+                {
+                    free(mask);
+                    return 0;
+                }
             }
             else if (probe_ret == MBUS_PROBE_NOTHING)
             {
@@ -2513,6 +2677,7 @@ mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
             else // MBUS_PROBE_ERROR
             {
                 MBUS_ERROR("%s: Failed to probe secondary address [%s].\n", __PRETTY_FUNCTION__, mask);
+                free(mask);
                 return -1;
             }
         }
@@ -2520,6 +2685,13 @@ mbus_scan_2nd_address_range(mbus_handle * handle, int pos, char *addr_mask)
 
     free(mask);
     return 0;
+}
+
+int
+mbus_scan_2nd_address_range(mbus_handle * handle, int pos, const char *addr_mask)
+{
+    bool aborted = false;
+    return mbus_scan_2nd_address_range_internal(handle, pos, addr_mask, &aborted);
 }
 
 //------------------------------------------------------------------------------
