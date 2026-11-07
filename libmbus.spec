@@ -11,19 +11,19 @@
 
 Summary: 	Open source M-bus (Meter-Bus) library
 Name: 		libmbus
-Version: 	0.9.0
+Version: 	0.10.4
 Release: 	1
 Source:	 	https://github.com/rscada/%{name}/archive/%{version}.tar.gz
 URL:		https://github.com/rscada/libmbus/
 License:	BSD
 Vendor:		Raditex Control AB
-Packager:	Stefan Wahren <info@lategoodbye.de>
+Packager:	Stefan Wahren <libmbus@gmx.net>
 Group: 		Development/Languages/C and C++ 
 BuildRoot: 	{_tmppath}/%{name}-%{version}-build
 AutoReqProv:	on 
 
 %description
-libmbus: M-bus Library from Raditex Control (http://www.rscada.se)
+libmbus: M-bus Library from Raditex Control
 
 libmbus is an open source library for the M-bus (Meter-Bus) protocol. 
 The Meter-Bus is a standard for reading out meter data from electricity meters, 
@@ -31,8 +31,6 @@ heat meters, gas meters, etc. The M-bus standard deals with both the electrical
 signals on the M-Bus, and the protocol and data format used in transmissions 
 on the M-Bus. The role of libmbus is to decode/encode M-bus data, and to handle
 the communication with M-Bus devices.
-
-For more information see http://www.rscada.se/libmbus
 
 %package devel
 License:        BSD
@@ -64,7 +62,7 @@ rm -rf "%buildroot"
 
 %files
 %defattr (-,root,root)
-%doc COPYING README.md
+%doc COPYING README.md SECURITY.md
 %{_bindir}/mbus-serial-*
 %{_bindir}/mbus-tcp-*
 %{_libdir}/libmbus.so*
@@ -79,6 +77,22 @@ rm -rf "%buildroot"
 %{_libdir}/pkgconfig/libmbus.pc
 
 %changelog
+* Tue Oct 20 2026 Stefan Wahren <libmbus@gmx.net> - 0.10.4-1
+- bump version
+
+* Wed Aug 26 2026 Stefan Wahren <libmbus@gmx.net> - 0.10.3-1
+- bump version
+
+* Tue Jul 28 2026 Stefan Wahren <libmbus@gmx.net> - 0.10.2-1
+- bump version
+- update packager address
+
+* Sat Jul 25 2026 Stefan Wahren <libmbus@gmx.net> - 0.10.1-1
+- bump version
+
+* Sun Jul 19 2026 Stefan Wahren <wahrenst@gmx.net> - 0.10.0-1
+- bump version
+
 * Fri Feb 22 2019 Stefan Wahren <info@lategoodbye.de> - 0.9.0-1
 - switch to github repo
 - enable man pages
